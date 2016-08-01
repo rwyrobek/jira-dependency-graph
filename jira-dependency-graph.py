@@ -18,6 +18,7 @@ GOOGLE_CHART_URL = 'http://chart.apis.google.com/chart?'
 def log(*args):
     print(*args, file=sys.stderr)
 
+ESTIMATE_FIELD = 'customfield_10002'
 
 class JiraSearch(object):
     """ This factory will create the actual method used to fetch issues from JIRA. This is really just a closure that saves us having
@@ -26,7 +27,15 @@ class JiraSearch(object):
     def __init__(self, url, auth):
         self.url = url + '/rest/api/latest'
         self.auth = auth
-        self.fields = ','.join(['key', 'issuetype', 'issuelinks', 'subtasks'])
+        self.fields = ','.join([
+            'key',
+            'issuetype',
+            'issuelinks',
+            'subtasks',
+            'summary',
+            ESTIMATE_FIELD,
+            'status'
+        ])
 
     def get(self, uri, params={}):
         headers = {'Content-Type' : 'application/json'}
@@ -60,6 +69,32 @@ def build_graph_data(start_issue_key, jira, excludes):
     def get_key(issue):
         return issue['key']
 
+    def get_node_name(issue_key):
+        fields = jira.get_issue(issue_key)['fields']
+        summary = fields['summary']
+        if fields.get(ESTIMATE_FIELD):
+            estimate = ' [%d]' % fields.get(ESTIMATE_FIELD)
+        else:
+            estimate = ''
+
+        return "%s '%s'%s" % (issue_key, summary, estimate)
+
+    def get_formatted_node(issue_key):
+        fields = jira.get_issue(issue_key)['fields']
+        summary = fields['summary']
+        if fields.get(ESTIMATE_FIELD):
+            estimate = ' [%d]' % fields.get(ESTIMATE_FIELD)
+        else:
+            estimate = ''
+
+        result = "%s '%s'%s" % (issue_key, summary, estimate)
+        if fields['status']['name'] == 'Resolved':
+            result = '"' + result + '"' + '[style=filled]'
+        else:
+            result = '"' + result + '"'
+
+        return result
+
     def process_link(issue_key, link):
         if link.has_key('outwardIssue'):
             direction = 'outward'
@@ -87,7 +122,11 @@ def build_graph_data(start_issue_key, jira, excludes):
         if link_type == "blocks":
             extra = ',color="red"'
 
-        node = '"%s"->"%s"[label="%s"%s]' % (issue_key, linked_issue_key, link_type, extra)
+        node = '"%s"->"%s"[label="%s"%s]' % (
+            get_node_name(issue_key),
+            get_node_name(linked_issue_key),
+            link_type, extra
+        )
         return linked_issue_key, node
 
     # since the graph can be cyclic we need to prevent infinite recursion
@@ -96,6 +135,8 @@ def build_graph_data(start_issue_key, jira, excludes):
     def walk(issue_key, graph):
         """ issue is the JSON representation of the issue """
         issue = jira.get_issue(issue_key)
+        issue_summary = issue['fields']['summary']
+
         seen.append(issue_key)
         children = []
         fields = issue['fields']
@@ -104,14 +145,19 @@ def build_graph_data(start_issue_key, jira, excludes):
             for subtask in issues:
                 subtask_key = get_key(subtask)
                 log(subtask_key + ' => references epic => ' + issue_key)
-                node = '"%s"->"%s"[color=orange]' % (issue_key, subtask_key)
+                # link epic tasks backwards, so the epic is at the bottom/right
+                node = '"%s"->"%s"[color=orange]' % (
+                    get_node_name(subtask_key),
+                    get_node_name(issue_key))
                 graph.append(node)
                 children.append(subtask_key)
         if fields.has_key('subtasks'):
             for subtask in fields['subtasks']:
                 subtask_key = get_key(subtask)
                 log(issue_key + ' => has subtask => ' + subtask_key)
-                node = '"%s"->"%s"[color=blue][label="subtask"]' % (issue_key, subtask_key)
+                node = '"%s"->"%s"[color=blue][label="subtask"]' % (
+                    get_node_name(issue_key),
+                    get_node_name(subtask_key))
                 graph.append(node)
                 children.append(subtask_key)
         if fields.has_key('issuelinks'):
@@ -126,7 +172,13 @@ def build_graph_data(start_issue_key, jira, excludes):
             walk(child, graph)
         return graph
 
-    return walk(start_issue_key, [])
+    graph = walk(start_issue_key, [])
+    nodes = []
+    # left to right vs top to bottom
+    nodes.append("graph [rankdir=LR]")
+    for issue_key in seen:
+        nodes.append(get_formatted_node(issue_key))
+    return nodes + graph
 
 
 def create_graph_image(graph_data, image_file):
@@ -150,7 +202,7 @@ def create_graph_image(graph_data, image_file):
 
 
 def print_graph(graph_data):
-    print('digraph{%s}' % ';'.join(graph_data))
+    print('digraph{%s}' % ';\n'.join(graph_data))
 
 
 def parse_args():
